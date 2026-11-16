@@ -1,0 +1,906 @@
+extensions [csv]
+
+globals [
+  ;; Variables de Stock (Niveles) del Diagrama de Flujos
+  ofertas-pendientes-elaboracion
+  ofertas-aceptadas
+  proyectos-en-fabricacion
+  proyectos-pendientes-montaje
+  proyectos-entregados
+  personal-en-plantilla
+  personal-cualificado
+
+  ;; Variables de Flujo del Diagrama de Flujos
+  captacion
+  aceptacion
+  rechazo
+  inicio-fabricacion
+  finalizacion-fabricacion
+  montaje-puesta-en-marcha
+  contratacion
+  formacion-certificacion
+  bajas-plantilla
+  bajas-jubilaciones
+
+  ;; Variables Auxiliares del Diagrama de Flujos
+  reputacion
+  tasa-aceptacion
+  ofertas-enviadas
+  tiempo-revision
+  sobrecarga
+  carga-de-trabajo
+  retrasos
+  capacidad-fabricacion
+  capacidad-montaje
+  beneficios
+  necesidad-de-personal
+  capacidad-inversion-personal
+  tasa-de-bajas
+;; Variables puramente visuales para la animacion de cuellos de botella
+  cuello-ofertas?
+  cuello-fabricacion?
+  cuello-montaje?
+]
+
+;; Agentes visuales para representar la tuberia y los cuellos de botella en la vista
+breed [nodos nodo]
+breed [particulas particula]
+
+nodos-own [
+  nombre-nodo
+  valor-actual
+  es-cuello?
+]
+
+particulas-own [
+  etapa ;; 1: ofertas, 2: aceptadas, 3: fabricacion, 4: montaje, 6: rrhh-plantilla, 7: rrhh-cualificado, 8: baja-sin-formar, 9: baja-cualificado
+]
+
+;; ============================================================================
+;; PROCEDIMIENTO DE INICIALIZACION (SETUP)
+;; ============================================================================
+to setup
+  clear-all
+  reset-ticks
+
+  ;; 1. Inicializacion de Niveles (Stocks)
+  ;; Total plantilla cualificada inicial = 70 trabajadores (Equipos Lagos S.A.)
+  set personal-cualificado 70
+  set personal-en-plantilla 0
+
+  set ofertas-pendientes-elaboracion 10
+  set ofertas-aceptadas 3
+  set proyectos-en-fabricacion 5
+  set proyectos-pendientes-montaje 3
+  set proyectos-entregados 0
+
+  set beneficios 150000
+  ;; Reputacion expresada en porcentaje (0 a 100%) para que el monitor y el grafico coincidan exactamente
+  set reputacion 85.0
+  set retrasos 0
+
+  ;; 2. Calculo inicial de variables auxiliares y flujos
+  actualizar-reparto-personal
+  calcular-variables-auxiliares
+  calcular-flujos
+
+  ;; 3. Construccion del entorno visual en la Vista 2D de NetLogo
+  construir-escenario-visual
+  sincronizar-particulas-empleados
+  actualizar-visualizacion
+end
+
+;; ============================================================================
+;; PROCEDIMIENTO PRINCIPAL DE SIMULACION (GO)
+;; ============================================================================
+to go
+  ;; Paso 1: Reparto del personal cualificado hacia las 3 areas operativas del diagrama
+  ;; (El resto hasta personal-cualificado corresponde a administracion/direccion/otras areas)
+  actualizar-reparto-personal
+
+  ;; Paso 2: Calculo de todas las variables auxiliares segun conexiones causales
+  calcular-variables-auxiliares
+
+  ;; Paso 3: Calculo de todos los flujos (valvulas)
+  calcular-flujos
+
+  ;; Paso 4: Actualizacion de los Niveles (Ecuaciones de Euler, dt = 1 semana)
+  actualizar-niveles
+
+  ;; Paso 5: Actualizacion visual de nodos, tuberias, colores de alarma y particulas
+  mover-y-generar-particulas
+  actualizar-visualizacion
+
+  tick
+end
+
+;; ============================================================================
+;; ECUACIONES DEL MODELO (ESTRICTAMENTE FIELES AL DIAGRAMA DE FLUJOS)
+;; ============================================================================
+to actualizar-reparto-personal
+  ;; Garantiza que la suma de las 3 areas operativas no supere los 60 trabajadores
+  let suma-asignada (expertos + empleados-fabricacion + montadores)
+  if suma-asignada > 60 [
+    let factor-tope 60.0 / suma-asignada
+    set expertos max list 1 (round (expertos * factor-tope))
+    set empleados-fabricacion max list 1 (round (empleados-fabricacion * factor-tope))
+    set montadores max list 1 (60 - expertos - empleados-fabricacion)
+  ]
+end
+
+to calcular-variables-auxiliares
+  ;; Factor de disponibilidad real si la plantilla cualificada cae por debajo del personal asignado
+  let suma-asignada max list 1 (expertos + empleados-fabricacion + montadores)
+  let personal-operativo max list 3 (personal-cualificado - 10)
+  let factor-disp ifelse-value (personal-operativo >= suma-asignada) [ 1.0 ] [ max list 0.1 (personal-operativo / suma-asignada) ]
+  let exp-efectivos max list 1 (expertos * factor-disp)
+  let fab-efectivos max list 1 (empleados-fabricacion * factor-disp)
+  let mon-efectivos max list 1 (montadores * factor-disp)
+
+  ;; 1A. Comercial y Ofertas
+  set tiempo-revision max list 1 (ofertas-pendientes-elaboracion / max list 0.5 (exp-efectivos * 0.45))
+  set ofertas-enviadas min list ofertas-pendientes-elaboracion (exp-efectivos * (1 / max list 0.5 (tiempo-revision * 0.4)))
+
+  ;; 1B. Fabricacion y Montaje
+  set capacidad-fabricacion fab-efectivos * productividad-fabricacion
+  set capacidad-montaje mon-efectivos * productividad-montaje
+
+  ;; Retrasos: se generan cuando los proyectos acumulados superan la capacidad semanal
+  let exceso-montaje max list 0 (proyectos-pendientes-montaje - capacidad-montaje)
+  let exceso-fab max list 0 (proyectos-en-fabricacion - capacidad-fabricacion)
+  let exceso-ofertas max list 0 (ofertas-pendientes-elaboracion - (exp-efectivos * 0.45))
+  set retrasos (exceso-montaje * 0.35) + (exceso-fab * 0.15) + (exceso-ofertas * 0.08)
+
+  ;; Reputacion (escala coherente 0% a 100% tanto en monitor como en grafico):
+  ;; Sube muy despacio (+0.3%/sem) solo si no hay retrasos ni demoras; cae de forma clara con los retrasos y plazos largos
+  let penalizacion-retrasos retrasos * 1.4
+  let penalizacion-ofertas ifelse-value (tiempo-revision > 2.5) [ (tiempo-revision - 2.5) * 0.5 ] [ 0 ]
+  let recuperacion ifelse-value (retrasos < 0.4 and tiempo-revision <= 2.5) [ 0.35 ] [ 0 ]
+  set reputacion max list 5.0 (min list 100.0 (reputacion - penalizacion-retrasos - penalizacion-ofertas + recuperacion))
+
+  ;; Factor normalizado de reputacion [0.05 a 1.0] para las ecuaciones de flujo
+  let rep-norm reputacion / 100.0
+
+  ;; Tasa de aceptacion (0% a 85%): influida positivamente por Reputacion y negativamente por Retrasos
+  set tasa-aceptacion max list 0.05 (min list 0.85 (0.50 * rep-norm - (retrasos * 0.025)))
+
+  ;; Carga de trabajo: determinada por inicio de fabricacion y capacidad de fabricacion
+  let ratio-fab (ofertas-aceptadas + proyectos-en-fabricacion) / max list 0.5 (capacidad-fabricacion * 2.0)
+  set carga-de-trabajo ratio-fab
+
+  ;; Sobrecarga: alimentada por Ofertas pendientes de elaboracion y Carga de trabajo
+  let ratio-ofertas ofertas-pendientes-elaboracion / max list 1 (exp-efectivos * 1.8)
+  set sobrecarga (ratio-ofertas * 0.55) + (carga-de-trabajo * 0.45)
+
+  ;; Beneficios: Proyectos entregados * Margen/proyecto, minorados por Retrasos
+  let ingreso-semanal montaje-puesta-en-marcha * margen-proyecto
+  let coste-retrasos retrasos * (margen-proyecto * 0.25)
+  set beneficios max list 0 (beneficios + ingreso-semanal - coste-retrasos)
+
+  ;; 2. Circuito de Recursos Humanos
+  ;; Cuando hay sobrecarga, se dispara la necesidad de contratacion si hay capacidad de inversion
+  set necesidad-de-personal max list 0 ((sobrecarga - 0.75) * 5)
+  set capacidad-inversion-personal beneficios / 40000
+
+  ;; Tasa de bajas semanal: crece fuertemente con Sobrecarga y Sensibilidad a sobrecarga
+  set tasa-de-bajas min list 0.35 (0.004 + (max list 0 (sobrecarga - 0.55)) * sensibilidad-sobrecarga * 0.08)
+end
+
+to calcular-flujos
+  let rep-norm reputacion / 100.0
+
+  ;; Flujos Circuito Comercial y de Proyectos
+  set captacion leads-por-semana * rep-norm
+  set aceptacion ofertas-enviadas * tasa-aceptacion
+  set rechazo ofertas-enviadas * (1 - tasa-aceptacion)
+  set inicio-fabricacion ofertas-aceptadas * 0.8
+  set finalizacion-fabricacion min list proyectos-en-fabricacion capacidad-fabricacion
+  set montaje-puesta-en-marcha min list proyectos-pendientes-montaje capacidad-montaje
+
+  ;; Flujos Circuito Recursos Humanos
+  set contratacion min list necesidad-de-personal capacidad-inversion-personal
+
+  ;; Bajas en plantilla (antes de formarse):
+  ;; Los aprendices sufren mas la sobrecarga/desatencion (1.8x tasa de bajas) y permanecen expuestos
+  ;; durante todo el 'tiempo-formacion'. Si tiempo-formacion y sensibilidad-sobrecarga son altos,
+  ;; la gran mayoria abandona antes de llegar a certificarse.
+  let tasa-bajas-aprendices min list 0.65 (tasa-de-bajas * 1.8)
+  set bajas-plantilla personal-en-plantilla * tasa-bajas-aprendices
+
+  ;; Formacion y certificacion: solo sobreviven y se certifican quienes no causan baja durante el periodo
+  let disponibles-formacion max list 0 (personal-en-plantilla - bajas-plantilla)
+  set formacion-certificacion disponibles-formacion / max list 1 tiempo-formacion
+
+  ;; Bajas / Jubilaciones de personal cualificado
+  set bajas-jubilaciones personal-cualificado * tasa-de-bajas
+end
+
+to actualizar-niveles
+  set ofertas-pendientes-elaboracion max list 0 (ofertas-pendientes-elaboracion + captacion - aceptacion - rechazo)
+  set ofertas-aceptadas max list 0 (ofertas-aceptadas + aceptacion - inicio-fabricacion)
+  set proyectos-en-fabricacion max list 0 (proyectos-en-fabricacion + inicio-fabricacion - finalizacion-fabricacion)
+  set proyectos-pendientes-montaje max list 0 (proyectos-pendientes-montaje + finalizacion-fabricacion - montaje-puesta-en-marcha)
+  set proyectos-entregados proyectos-entregados + montaje-puesta-en-marcha
+  set personal-en-plantilla max list 0 (personal-en-plantilla + contratacion - formacion-certificacion - bajas-plantilla)
+  set personal-cualificado max list 13 (personal-cualificado + formacion-certificacion - bajas-jubilaciones)
+end
+
+;; ============================================================================
+;; VISUALIZACION GRAFICA E INTERACTIVA DE LOS CUELLOS DE BOTELLA
+;; ============================================================================
+to construir-escenario-visual
+  ask patches [
+    if pycor >= 0 [
+      ifelse pxcor < -3
+        [ set pcolor 99.3 ] ;; Zona 1A: Comercial y Ofertas
+        [ set pcolor 69.3 ] ;; Zona 1B: Fabricacion y Montaje
+    ]
+    if pycor < 0 [
+      set pcolor 139.3 ;; Zona 2: Recursos Humanos
+    ]
+    if pycor = 0 [
+      set pcolor grey - 2 ;; Linea divisoria
+    ]
+  ]
+
+  ask patch -10 9  [ set plabel "1A. COMERCIAL Y OFERTAS" set plabel-color blue - 2 ]
+  ask patch 6 9    [ set plabel "1B. FABRICACION Y MONTAJE" set plabel-color green - 3 ]
+  ask patch -4 -1  [ set plabel "2. CIRCUITO DE RECURSOS HUMANOS" set plabel-color magenta - 2 ]
+
+  ;; Fila superior (Y = 5): Circuito Comercial y de Proyectos
+  crear-nodo -14 5 "Leads Potenciales" 0
+  crear-nodo -9 5  "Ofertas Pendientes" ofertas-pendientes-elaboracion
+  crear-nodo -4 5  "Ofertas Aceptadas" ofertas-aceptadas
+  crear-nodo 2 5   "En Fabricacion" proyectos-en-fabricacion
+  crear-nodo 8 5   "Pendientes Montaje" proyectos-pendientes-montaje
+  crear-nodo 14 5  "Entregados" proyectos-entregados
+
+  ;; Fila inferior (Y = -4): Circuito de Recursos Humanos
+  crear-nodo -13 -4 "Candidatos" 0
+  crear-nodo -5 -4  "Personal Plantilla" personal-en-plantilla
+  crear-nodo 3 -4   "Personal Cualificado" personal-cualificado
+  crear-nodo 12 -4  "Salidas / Bajas" 0
+
+  ;; Nube inferior de Salidas desde Personal en Plantilla (Bajas antes de formarse, Y = -8.5)
+  crear-nodo -5 -8.5 "Bajas Plantilla" 0
+
+  ;; Conectar nodos superiores
+  conectar-nodos -14 5 -9 5
+  conectar-nodos -9 5 -4 5
+  conectar-nodos -4 5 2 5
+  conectar-nodos 2 5 8 5
+  conectar-nodos 8 5 14 5
+
+  ;; Conectar nodos inferiores (RRHH) incluyendo la valvula de bajas antes de formarse
+  conectar-nodos -13 -4 -5 -4
+  conectar-nodos -5 -4 3 -4
+  conectar-nodos 3 -4 12 -4
+  conectar-nodos -5 -4 -5 -8.5
+end
+
+to crear-nodo [x y nombre val]
+  create-nodos 1 [
+    setxy x y
+    set shape "box"
+    set size 2.1
+    set color white
+    set nombre-nodo nombre
+    set valor-actual val
+    set es-cuello? false
+    set label-color black
+  ]
+end
+
+to conectar-nodos [x1 y1 x2 y2]
+  let origen one-of nodos with [xcor = x1 and ycor = y1]
+  let destino one-of nodos with [xcor = x2 and ycor = y2]
+  if origen != nobody and destino != nobody [
+    ask origen [
+      create-link-to destino [
+        set color grey
+        set thickness 0.15
+      ]
+    ]
+  ]
+end
+
+to sincronizar-particulas-empleados
+  create-particulas round personal-en-plantilla [
+    setxy (-5 + random-float 1.6 - 0.8) (-4 + random-float 1.6 - 0.8)
+    set shape "person"
+    set size 0.85
+    set color orange
+    set etapa 6
+  ]
+  create-particulas round personal-cualificado [
+    setxy (3 + random-float 2.2 - 1.1) (-4 + random-float 2.2 - 1.1)
+    set shape "person"
+    set size 0.85
+    set color cyan - 2
+    set etapa 7
+  ]
+end
+
+to actualizar-visualizacion
+  set cuello-ofertas? (ofertas-pendientes-elaboracion > (expertos * 1.8))
+  set cuello-fabricacion? (proyectos-en-fabricacion > (capacidad-fabricacion * 1.6))
+  set cuello-montaje? (proyectos-pendientes-montaje > (capacidad-montaje * 1.4))
+
+  let otras-areas 10
+
+  ask nodos [
+    if nombre-nodo = "Leads Potenciales" [
+      set color sky
+      set label (word "Leads: " precision captacion 1 "/sem")
+    ]
+    if nombre-nodo = "Ofertas Pendientes" [
+      set valor-actual ofertas-pendientes-elaboracion
+      set es-cuello? cuello-ofertas?
+      set size max list 1.8 (min list 3.6 (1.8 + ofertas-pendientes-elaboracion * 0.06))
+      set color ifelse-value es-cuello? [ red ] [ ifelse-value (ofertas-pendientes-elaboracion > expertos * 1.1) [ orange ] [ green + 1 ] ]
+      set label (word "Ofertas: " precision valor-actual 1 ifelse-value es-cuello? [ " [CUELLO!]" ] [ "" ])
+    ]
+    if nombre-nodo = "Ofertas Aceptadas" [
+      set valor-actual ofertas-aceptadas
+      set color blue + 1
+      set size max list 1.8 (min list 3.0 (1.8 + ofertas-aceptadas * 0.08))
+      set label (word "Aceptadas: " precision valor-actual 1)
+    ]
+    if nombre-nodo = "En Fabricacion" [
+      set valor-actual proyectos-en-fabricacion
+      set es-cuello? cuello-fabricacion?
+      set size max list 1.8 (min list 3.6 (1.8 + proyectos-en-fabricacion * 0.08))
+      set color ifelse-value es-cuello? [ red ] [ ifelse-value (proyectos-en-fabricacion > capacidad-fabricacion * 1.1) [ orange ] [ green + 1 ] ]
+      set label (word "Fabricacion: " precision valor-actual 1 ifelse-value es-cuello? [ " [SATURADO!]" ] [ "" ])
+    ]
+    if nombre-nodo = "Pendientes Montaje" [
+      set valor-actual proyectos-pendientes-montaje
+      set es-cuello? cuello-montaje?
+      set size max list 1.8 (min list 3.6 (1.8 + proyectos-pendientes-montaje * 0.1))
+      set color ifelse-value es-cuello? [ red ] [ ifelse-value (proyectos-pendientes-montaje > capacidad-montaje * 1.0) [ orange ] [ green + 1 ] ]
+      set label (word "Montaje: " precision valor-actual 1 ifelse-value es-cuello? [ " [CUELLO!]" ] [ "" ])
+    ]
+    if nombre-nodo = "Entregados" [
+      set valor-actual proyectos-entregados
+      set color green - 1
+      set label (word "Entregados: " precision valor-actual 0)
+    ]
+    if nombre-nodo = "Candidatos" [
+      set color violet + 1
+      set label (word "Contratando: " precision contratacion 2 "/sem")
+    ]
+    if nombre-nodo = "Personal Plantilla" [
+      set valor-actual personal-en-plantilla
+      set color yellow - 1
+      set size max list 1.8 (min list 3.2 (1.8 + personal-en-plantilla * 0.1))
+      set label (word "En Formacion: " precision valor-actual 1)
+    ]
+    if nombre-nodo = "Personal Cualificado" [
+      set valor-actual personal-cualificado
+      set color ifelse-value (personal-cualificado < 55) [ red + 1 ] [ cyan - 1 ]
+      set size max list 1.8 (min list 3.4 (1.6 + personal-cualificado * 0.028))
+      set label (word "Total: " round valor-actual " (Exp:" expertos " Fab:" empleados-fabricacion " Mon:" montadores " Otros:" otras-areas ")")
+    ]
+    if nombre-nodo = "Salidas / Bajas" [
+      set color grey
+      set label (word "Bajas Cualif: " precision bajas-jubilaciones 2 "/sem")
+    ]
+    if nombre-nodo = "Bajas Plantilla" [
+      set color red + 2
+      set size 1.6
+      set label (word "Bajas sin formar: " precision bajas-plantilla 2 "/sem")
+    ]
+  ]
+
+  ask links [
+    set color ifelse-value ([es-cuello?] of end2) [ red ] [ grey ]
+    set thickness ifelse-value ([es-cuello?] of end2) [ 0.35 ] [ 0.15 ]
+  ]
+end
+
+to mover-y-generar-particulas
+  ;; 1. Particulas de Proyectos (circuito superior)
+  let num-nuevas round captacion
+  create-particulas num-nuevas [
+    setxy -14 (5 + random-float 1.0 - 0.5)
+    set shape "circle"
+    set size 0.55
+    set color blue
+    set etapa 1
+  ]
+
+  ;; 2. Mantener sincronizada la poblacion visual de empleados con los niveles reales
+  let activos-formacion count particulas with [etapa = 6]
+  let objetivo-formacion round personal-en-plantilla
+  if activos-formacion < objetivo-formacion [
+    create-particulas (objetivo-formacion - activos-formacion) [
+      setxy -13 (-4 + random-float 0.8 - 0.4)
+      set shape "person"
+      set size 0.85
+      set color violet
+      set etapa 6
+    ]
+  ]
+
+  let activos-cualif count particulas with [etapa = 7]
+  let objetivo-cualif round personal-cualificado
+  if activos-cualif < objetivo-cualif [
+    create-particulas (objetivo-cualif - activos-cualif) [
+      setxy (3 + random-float 2.0 - 1.0) (-4 + random-float 2.0 - 1.0)
+      set shape "person"
+      set size 0.85
+      set color cyan - 2
+      set etapa 7
+    ]
+  ]
+
+  ;; Si baja el stock en formacion, enviamos proporcionalmente a Bajas sin formar (etapa 8) o a Cualificados (etapa 7)
+  if activos-formacion > objetivo-formacion [
+    ask n-of (activos-formacion - objetivo-formacion) particulas with [etapa = 6] [
+      ifelse random-float 1.0 < (bajas-plantilla / max list 0.001 (bajas-plantilla + formacion-certificacion)) [
+        set etapa 8
+        set color red
+      ] [
+        set etapa 7
+        set color cyan - 2
+      ]
+    ]
+  ]
+
+  ;; Si baja el stock de cualificados, salen hacia Salidas / Bajas (etapa 9)
+  if activos-cualif > objetivo-cualif [
+    ask n-of (activos-cualif - objetivo-cualif) particulas with [etapa = 7] [
+      set etapa 9
+      set color red
+    ]
+  ]
+
+  ask particulas [
+    if etapa = 1 [
+      ifelse xcor < -9 [
+        set xcor xcor + 1.2
+      ] [
+        ifelse cuello-ofertas? [
+          set color red
+          setxy (-9 + random-float 1.8 - 0.9) (5 + random-float 1.8 - 0.9)
+          if random-float 1.0 < (aceptacion / max list 1 ofertas-pendientes-elaboracion) [
+            set etapa 2
+            set color green
+          ]
+        ] [
+          set etapa 2
+          set color green
+        ]
+      ]
+    ]
+    if etapa = 2 [
+      ifelse xcor < 2 [
+        set xcor xcor + 1.5
+      ] [
+        ifelse cuello-fabricacion? [
+          set color orange
+          setxy (2 + random-float 1.8 - 0.9) (5 + random-float 1.8 - 0.9)
+          if random-float 1.0 < (finalizacion-fabricacion / max list 1 proyectos-en-fabricacion) [
+            set etapa 3
+          ]
+        ] [
+          set etapa 3
+        ]
+      ]
+    ]
+    if etapa = 3 [
+      ifelse xcor < 8 [
+        set xcor xcor + 1.5
+      ] [
+        ifelse cuello-montaje? [
+          set color red
+          setxy (8 + random-float 1.8 - 0.9) (5 + random-float 1.8 - 0.9)
+          if random-float 1.0 < (montaje-puesta-en-marcha / max list 1 proyectos-pendientes-montaje) [
+            set etapa 4
+            set color lime
+          ]
+        ] [
+          set etapa 4
+          set color lime
+        ]
+      ]
+    ]
+    if etapa = 4 [
+      ifelse xcor < 14 [
+        set xcor xcor + 2.0
+      ] [
+        die
+      ]
+    ]
+    if etapa = 6 [
+      ifelse xcor < -5 [
+        set xcor xcor + 1.4
+      ] [
+        set color orange
+        setxy (-5 + random-float 1.6 - 0.8) (-4 + random-float 1.6 - 0.8)
+      ]
+    ]
+    if etapa = 7 [
+      ifelse xcor < 3 [
+        set xcor xcor + 1.4
+      ] [
+        setxy (3 + random-float 2.2 - 1.1) (-4 + random-float 2.2 - 1.1)
+      ]
+    ]
+    if etapa = 8 [
+      ifelse ycor > -8.5 [
+        set ycor ycor - 1.2
+      ] [
+        die
+      ]
+    ]
+    if etapa = 9 [
+      ifelse xcor < 12 [
+        set xcor xcor + 1.5
+      ] [
+        die
+      ]
+    ]
+  ]
+end
+@#$#@#$#@
+GRAPHICS-WINDOW
+295
+10
+955
+425
+-1
+-1
+19.5
+1
+10
+1
+1
+1
+0
+0
+0
+1
+-16
+16
+-10
+10
+0
+0
+1
+ticks
+30.0
+
+BUTTON
+15
+15
+145
+48
+Setup
+setup
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+BUTTON
+155
+15
+285
+48
+Go (Simular)
+go
+T
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+SLIDER
+15
+60
+285
+93
+leads-por-semana
+leads-por-semana
+1
+15
+5
+0.5
+1
+leads/sem
+HORIZONTAL
+
+SLIDER
+15
+100
+285
+133
+productividad-fabricacion
+productividad-fabricacion
+0.02
+0.25
+0.08
+0.01
+1
+proy/emp-sem
+HORIZONTAL
+
+SLIDER
+15
+140
+285
+173
+productividad-montaje
+productividad-montaje
+0.02
+0.25
+0.09
+0.01
+1
+proy/mon-sem
+HORIZONTAL
+
+SLIDER
+15
+180
+285
+213
+margen-proyecto
+margen-proyecto
+10000
+150000
+45000
+5000
+1
+EUR
+HORIZONTAL
+
+SLIDER
+15
+220
+285
+253
+tiempo-formacion
+tiempo-formacion
+4
+52
+24
+1
+1
+semanas
+HORIZONTAL
+
+SLIDER
+15
+260
+285
+293
+sensibilidad-sobrecarga
+sensibilidad-sobrecarga
+0.1
+3.0
+1.0
+0.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+15
+300
+285
+333
+expertos
+expertos
+1
+30
+8
+1
+1
+pers
+HORIZONTAL
+
+SLIDER
+15
+340
+285
+373
+empleados-fabricacion
+empleados-fabricacion
+1
+50
+34
+1
+1
+pers
+HORIZONTAL
+
+SLIDER
+15
+380
+285
+413
+montadores
+montadores
+1
+40
+18
+1
+1
+pers
+HORIZONTAL
+
+MONITOR
+15
+425
+145
+470
+Sobrecarga
+precision sobrecarga 2
+17
+1
+11
+
+MONITOR
+155
+425
+285
+470
+Reputacion (%)
+precision reputacion 1
+17
+1
+11
+
+MONITOR
+15
+480
+145
+525
+Retrasos
+precision retrasos 2
+17
+1
+11
+
+MONITOR
+155
+480
+285
+525
+Beneficios (EUR)
+round beneficios
+17
+1
+11
+
+MONITOR
+15
+535
+285
+580
+Personal Asignado (Max 60)
+expertos + empleados-fabricacion + montadores
+17
+1
+11
+
+PLOT
+295
+435
+510
+615
+Evolucion de Cuellos de Botella
+Semanas
+Proyectos / Ofertas
+0.0
+100.0
+0.0
+40.0
+true
+true
+"" ""
+PENS
+"Ofertas Pendientes" 1.0 0 -2674135 true "" "plot ofertas-pendientes-elaboracion"
+"En Fabricacion" 1.0 0 -955883 true "" "plot proyectos-en-fabricacion"
+"Pendientes Montaje" 1.0 0 -13345367 true "" "plot proyectos-pendientes-montaje"
+"Entregados" 1.0 0 -10899396 true "" "plot proyectos-entregados"
+
+PLOT
+518
+435
+733
+615
+Recursos Humanos y Sobrecarga
+Semanas
+Personas / Indice
+0.0
+100.0
+0.0
+80.0
+true
+true
+"" ""
+PENS
+"Personal Cualificado" 1.0 0 -13840069 true "" "plot personal-cualificado"
+"Personal en Plantilla" 1.0 0 -2674135 true "" "plot personal-en-plantilla"
+"Sobrecarga (x20)" 1.0 0 -6459832 true "" "plot sobrecarga * 20"
+
+PLOT
+740
+435
+955
+615
+Reputacion y Retrasos
+Semanas
+% Reputacion / Retrasos
+0.0
+100.0
+0.0
+100.0
+true
+true
+"" ""
+PENS
+"Reputacion (%)" 1.0 0 -13345367 true "" "plot reputacion"
+"Retrasos (x5)" 1.0 0 -2674135 true "" "plot min list 100 (retrasos * 5)"
+"Tasa Aceptacion (%)" 1.0 0 -10899396 true "" "plot tasa-aceptacion * 100"
+
+@#$#@#$#@
+@#$#@#$#@
+default
+true
+0
+Polygon -7500403 true true 150 5 40 250 150 205 260 250
+
+circle
+false
+0
+Circle -7500403 true true 0 0 300
+
+box
+false
+0
+Polygon -7500403 true true 150 285 285 225 285 75 150 135
+Polygon -7500403 true true 150 135 15 75 150 15 285 75
+Polygon -7500403 true true 15 75 150 135 150 285 15 225
+
+person
+true
+0
+Circle -7500403 true true 110 5 80
+Polygon -7500403 true true 105 90 120 195 90 285 105 300 135 300 150 225 165 300 195 300 210 285 180 195 195 90
+Rectangle -7500403 true true 127 79 172 94
+Polygon -7500403 true true 195 90 240 150 225 180 165 105
+Polygon -7500403 true true 105 90 60 150 75 180 135 105
+
+@#$#@#$#@
+NetLogo 6.4.0
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+default
+0.0
+-0.2 0 0.0 1.0
+0.0 1 1.0 0.0
+0.2 0 0.0 1.0
+link direction
+true
+0
+Line -7500403 true 150 150 90 180
+Line -7500403 true 150 150 210 180
+@#$#@#$#@
+0
+@#$#@#$#@
